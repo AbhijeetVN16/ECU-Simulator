@@ -1,0 +1,109 @@
+{
+  "ecu_profile": "Gateway_ECU_Sim",
+  "uds_settings": {
+    "p2_timeout_ms": 50,
+    "p2_star_timeout_ms": 2000,
+    "tester_present_timeout_s": 5
+  },
+  "vulnerabilities": [
+    {
+      "id": "VULN-001",
+      "name": "VIN_Write_Overflow",
+      "description": "Sending > 20 bytes to DID 0xF190 (VIN) crashes the service",
+      "trigger": {
+        "sid": "0x2E",
+        "did": "0xF190",
+        "condition": "payload_length > 20"
+      },
+      "effect": {
+        "action": "CRASH",
+        "behavior": "STOP_RESPONDING",
+        "log_message": "Memory Corruption detected in VIN buffer"
+      },
+      "enabled": true
+    },
+    {
+      "id": "VULN-002",
+      "name": "Security_Bypass_Magic_Byte",
+      "description": "Writing to DID 0x0101 succeeds if first byte is 0xAA, even if locked",
+      "trigger": {
+        "sid": "0x2E",
+        "did": "0x0101",
+        "required_byte_index": 0,
+        "required_byte_value": "0xAA"
+      },
+      "effect": {
+        "action": "BYPASS_SECURITY",
+        "behavior": "POSITIVE_RESPONSE",
+        "log_message": "Security bypass triggered via magic byte"
+      },
+      "enabled": true
+    },
+    {
+      "id": "VULN-003",
+      "name": "Resource_Exhaustion_DoS",
+      "description": "Rapid Tester Present frames cause a 5-second hang",
+      "trigger": {
+        "sid": "0x3E",
+        "frequency_hz_gt": 100,
+        "duration_seconds": 2
+      },
+      "effect": {
+        "action": "HANG",
+        "duration_ms": 5000,
+        "behavior": "FORCE_P2_STAR_TIMEOUT",
+        "log_message": "Internal message queue overflow - CPU at 100%"
+      },
+      "enabled": false
+    },
+    {
+      "id": "VULN-004",
+      "name": "ISO_TP_Segment_Overlap",
+      "description": "Simulates a bug where overlapping sequence numbers in CF frames causes a crash",
+      "trigger": {
+        "layer": "ISO-TP",
+        "error_type": "OUT_OF_ORDER_CF",
+        "sequence_pattern": [1, 2, 2, 3]
+      },
+      "effect": {
+        "action": "CRASH",
+        "behavior": "SILENT_ABANDON",
+        "log_message": "ISO-TP Reassembly Engine exception"
+      },
+      "enabled": true
+    },
+    {
+      "id": "VULN-005",
+      "name": "Diagnostic_Session_Leaking",
+      "description": "Entering Programming Session (0x02) without proper transition from Extended",
+      "trigger": {
+        "sid": "0x10",
+        "sub_function": "0x02",
+        "previous_session_not": "0x03"
+      },
+      "effect": {
+        "action": "LOGIC_ERR",
+        "behavior": "ACCEPT_ILLEGAL_TRANSITION",
+        "log_message": "Unauthorized state transition to Programming Session"
+      },
+      "enabled": true
+    },
+    {
+      "id": "VULN-006",
+      "name": "Weak_Seed_Entropy",
+      "description": "ECU provides predictable seeds for Service 0x27",
+      "trigger": {
+        "sid": "0x27",
+        "sub_function": "0x01"
+      },
+      "effect": {
+        "action": "MODIFY_RESPONSE",
+        "mode": "STATIC_SEED",
+        "values": ["0xDE", "0xAD", "0xBE", "0xEF"],
+        "entropy_flaw_type": "constant",
+        "log_message": "Vulnerability triggered: Sent static seed 0xDEADBEEF"
+      },
+      "enabled": true
+    }
+  ]
+}
