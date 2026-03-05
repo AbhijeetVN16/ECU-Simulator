@@ -24,30 +24,32 @@ except ImportError:
     _elog = _FakeLog()
 
 # ─────────────────────────── PALETTE ──────────────────────────────────────────
+# Readability pass: backgrounds lifted to #1E1E1E range, text boosted to near-
+# white, accent colours brightened so they pop on the lighter base.
 C = {
-    "bg":           "#080C0F",   # near-black with blue tint
-    "bg2":          "#0D1318",   # panel background
-    "bg3":          "#111820",   # slightly lighter panel
-    "border":       "#1A2530",   # subtle border
-    "border_hi":    "#243040",   # highlighted border
-    "phosphor":     "#00FF7F",   # primary green — spring green phosphor
-    "phosphor_dim": "#007040",   # dimmed phosphor
-    "phosphor_lo":  "#003820",   # very dim
-    "amber":        "#FFB300",   # amber for warnings
-    "amber_dim":    "#7A5500",
-    "red":          "#FF3040",   # error red
-    "red_dim":      "#6A0010",
-    "blue":         "#2090FF",   # DEFAULT session
-    "blue_dim":     "#0A3570",
-    "yellow":       "#FFD700",   # EXTENDED session
-    "yellow_dim":   "#5A4800",
-    "cyan":         "#00D4FF",   # accent / processing
-    "cyan_dim":     "#003A50",
-    "white":        "#E8F0F4",
-    "mid":          "#5A7080",
-    "text_dim":     "#3A5060",
-    "font_mono":    "Courier",   # authentic terminal feel
-    "font_hud":     "Courier",
+    "bg":           "#1E1E1E",   # VS Code-style dark grey — easy on the eyes
+    "bg2":          "#252526",   # panel background (slightly lighter)
+    "bg3":          "#2D2D30",   # widget / button surface
+    "border":       "#3C3C3C",   # visible but unobtrusive border
+    "border_hi":    "#555558",   # hover / highlight border
+    "phosphor":     "#4EC994",   # muted spring-green — readable on #1E1E1E
+    "phosphor_dim": "#2A7A58",   # dimmed state
+    "phosphor_lo":  "#1A4A38",   # very dim (bar graph floor)
+    "amber":        "#FFB84D",   # warm amber — higher contrast than pure orange
+    "amber_dim":    "#8A6020",
+    "red":          "#F44747",   # VS Code error red — vivid but not harsh
+    "red_dim":      "#7A1A1A",
+    "blue":         "#4FC1FF",   # DEFAULT session — bright sky blue
+    "blue_dim":     "#1A4A70",
+    "yellow":       "#FFD866",   # EXTENDED session — warm yellow
+    "yellow_dim":   "#6A5010",
+    "cyan":         "#56D8FF",   # accent / processing
+    "cyan_dim":     "#1A5060",
+    "white":        "#F0F0F0",   # primary log text — true near-white
+    "mid":          "#9DABB8",   # secondary labels — clearly readable
+    "text_dim":     "#6A7B88",   # tertiary / disabled text
+    "font_mono":    "Consolas",  # Consolas: clean monospace, great at any size
+    "font_hud":     "Consolas",
 }
 
 # Session colour maps
@@ -246,9 +248,9 @@ class FlowArrow(tk.Canvas):
         mid   = H // 2
         # Labels
         self.create_text(10, mid, text="TESTER", fill=C["mid"],
-                         font=(C["font_hud"], 8, "bold"), anchor="w")
+                         font=(C["font_hud"], 9, "bold"), anchor="w")
         self.create_text(W-10, mid, text="ECU", fill=C["mid"],
-                         font=(C["font_hud"], 8, "bold"), anchor="e")
+                         font=(C["font_hud"], 9, "bold"), anchor="e")
         # Static track line
         lx1, lx2 = 60, W - 50
         self._track_line = self.create_line(lx1, mid, lx2, mid,
@@ -265,7 +267,7 @@ class FlowArrow(tk.Canvas):
         ]
         # Direction label
         self._dir_label = self.create_text(W//2, 8, text="", fill=C["phosphor_dim"],
-                                           font=(C["font_hud"], 7), anchor="center")
+                                           font=(C["font_hud"], 9), anchor="center")
 
     def _update_particles(self):
         W, H = self.W, self.H
@@ -351,44 +353,55 @@ class BarGraph(tk.Canvas):
 class PhosphorLog(tk.Frame):
     """ScrolledText log panel with highlight-flash on new entries."""
 
-    # Tag name → base colour
+    # ── Readability pass: all tag colours verified for WCAG AA contrast on #1E1E1E
     TAG_STYLES = {
-        "normal":  C["phosphor"],
-        "warn":    C["amber"],
-        "error":   C["red"],
-        "oracle":  "#FFD700",
-        "system":  C["cyan"],
-        "rx":      C["phosphor"],
-        "tx":      "#80FFB0",
-        "dim":     C["phosphor_dim"],
+        "normal":  "#C8E6C8",   # soft green — readable body text (was dim phosphor)
+        "warn":    "#FFD080",   # warm amber — WARN / VULN lines
+        "error":   "#F47C7C",   # desaturated red — avoids eye strain on dark bg
+        "oracle":  "#FFE066",   # bright yellow — oracle / detection messages
+        "system":  "#7ECFED",   # sky blue — [SYSTEM] / [CONFIG] lines
+        "rx":      "#A8D8A8",   # pale green — incoming RX frames
+        "tx":      "#B8F0C8",   # lighter green — outgoing TX frames
+        "dim":     "#7A9A7A",   # muted green — low-priority debug
     }
     FLASH_COLOR = "#FFFFFF"
-    FLASH_MS    = 120
+    FLASH_MS    = 140   # slightly longer flash so it registers at a glance
+
+    # ── Font config — change these two constants to tune all log panels
+    LOG_FONT_FAMILY = "Consolas"   # Consolas ships with Windows & most Linux
+    LOG_FONT_SIZE   = 14           # 14 pt: clear at arm's length on any monitor
 
     def __init__(self, parent, title: str = "", **kw):
         super().__init__(parent, bg=C["bg2"], **kw)
         # header
-        hdr = tk.Frame(self, bg=C["bg2"], pady=2)
+        hdr = tk.Frame(self, bg=C["bg2"], pady=3)
         hdr.pack(fill="x")
         self._title_var = tk.StringVar(value=title)
         tk.Label(hdr, textvariable=self._title_var,
                  bg=C["bg2"], fg=C["mid"],
-                 font=(C["font_hud"], 8, "bold")).pack(side="left", padx=6)
+                 font=(C["font_hud"], 10, "bold")).pack(side="left", padx=8)
         self._count_var = tk.StringVar(value="0 msgs")
         tk.Label(hdr, textvariable=self._count_var,
                  bg=C["bg2"], fg=C["text_dim"],
-                 font=(C["font_hud"], 7)).pack(side="right", padx=6)
+                 font=(C["font_hud"], 9)).pack(side="right", padx=8)
         # canvas border
         border = tk.Frame(self, bg=C["border"], padx=1, pady=1)
-        border.pack(fill="both", expand=True, padx=4, pady=(0,4))
-        self._text = tk.Text(border, bg=C["bg"], fg=C["phosphor"],
-                             insertbackground=C["phosphor"],
-                             font=(C["font_mono"], 9),
-                             wrap="none", bd=0, relief="flat",
-                             selectbackground=C["border_hi"],
-                             selectforeground=C["white"])
+        border.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._text = tk.Text(
+            border,
+            bg=C["bg"],
+            fg="#C8E6C8",                          # default text colour (matches "normal" tag)
+            insertbackground=C["phosphor"],
+            font=(self.LOG_FONT_FAMILY, self.LOG_FONT_SIZE),
+            wrap="none", bd=0, relief="flat",
+            width=1,      # ← suppress natural-width demand; geometry manager owns sizing
+            selectbackground=C["border_hi"],
+            selectforeground=C["white"],
+            spacing1=2,   # pixels above each line — adds breathing room
+            spacing3=2,   # pixels below each line
+        )
         sb = tk.Scrollbar(border, orient="vertical", command=self._text.yview,
-                          bg=C["bg3"], troughcolor=C["bg"], width=8)
+                          bg=C["bg3"], troughcolor=C["bg2"], width=10)
         self._text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self._text.pack(side="left", fill="both", expand=True)
@@ -396,8 +409,8 @@ class PhosphorLog(tk.Frame):
         # configure tags
         for tag, col in self.TAG_STYLES.items():
             self._text.tag_config(tag, foreground=col)
-        self._text.tag_config("flash", background=C["border_hi"], foreground=C["white"])
-        self._text.tag_config("flash_hi", background="#203A28", foreground=C["phosphor"])
+        self._text.tag_config("flash",    background=C["border_hi"], foreground=C["white"])
+        self._text.tag_config("flash_hi", background="#2A3D2E",      foreground=C["white"])
 
         self._count  = 0
         self._parent = parent
@@ -426,9 +439,9 @@ class PhosphorLog(tk.Frame):
         self._text.insert("end", line, (tag,))
         end   = self._text.index("end-1c")
 
-        # flash highlight
+        # flash highlight — brief pale-green background so the new line pops
         flash_tag = f"fl_{self._count}"
-        self._text.tag_config(flash_tag, background="#1A3025", foreground=C["white"])
+        self._text.tag_config(flash_tag, background="#2E3D2E", foreground=C["white"])
         self._text.tag_add(flash_tag, start, end)
         self._text.after(self.FLASH_MS, lambda t=flash_tag: self._clear_flash(t))
 
@@ -462,11 +475,11 @@ class StatBadge(tk.Frame):
         super().__init__(parent, bg=C["bg"], padx=8, pady=3, **kw)
         self._color  = color or C["mid"]
         tk.Label(self, text=label, bg=C["bg"], fg=C["text_dim"],
-                 font=(C["font_hud"], 7)).pack()
+                 font=(C["font_hud"], 9)).pack()
         self._val_var = tk.StringVar(value=initial)
         self._val_lbl = tk.Label(self, textvariable=self._val_var,
                                  bg=C["bg"], fg=self._color,
-                                 font=(C["font_hud"], 11, "bold"))
+                                 font=(C["font_hud"], 13, "bold"))
         self._val_lbl.pack()
 
     def set(self, value: str, color: str = None):
@@ -490,7 +503,7 @@ class CounterBox(tk.Frame):
         super().__init__(parent, bg=C["bg"], **kw)
         self._can_n   = self._make("CAN FRAMES",  C["phosphor"])
         self._uds_n   = self._make("UDS REQUESTS", C["cyan"])
-        self._vuln_n  = self._make("VULNS HIT",   C["amber"])
+        self._vuln_n  = self._make("JSON LOAD COUNT",   C["amber"])
         self.can_count  = 0
         self.uds_count  = 0
         self.vuln_count = 0
@@ -499,12 +512,12 @@ class CounterBox(tk.Frame):
         f = tk.Frame(self, bg=C["bg3"], padx=10, pady=4,
                      relief="flat", bd=0)
         f.pack(side="left", padx=3)
-        tk.Frame(f, bg=color, height=2).pack(fill="x")
+        tk.Frame(f, bg=color, height=3).pack(fill="x")
         v = tk.StringVar(value="0")
         tk.Label(f, textvariable=v, bg=C["bg3"], fg=color,
-                 font=(C["font_hud"], 16, "bold")).pack()
+                 font=(C["font_hud"], 18, "bold")).pack()
         tk.Label(f, text=label, bg=C["bg3"], fg=C["mid"],
-                 font=(C["font_hud"], 7)).pack()
+                 font=(C["font_hud"], 9)).pack()
         return {"var": v, "widget": f, "color": color}
 
     def bump_can(self):
@@ -546,10 +559,10 @@ class SessionIndicator(tk.Canvas):
                                               width=1)
         self._label   = self.create_text(self.W//2, self.H//2 - 5,
                                          text="DEFAULT",
-                                         fill=C["blue"], font=(C["font_hud"], 9, "bold"))
-        self._sub     = self.create_text(self.W//2, self.H//2 + 8,
+                                         fill=C["blue"], font=(C["font_hud"], 11, "bold"))
+        self._sub     = self.create_text(self.W//2, self.H//2 + 9,
                                          text="SESSION", fill=C["mid"],
-                                         font=(C["font_hud"], 7))
+                                         font=(C["font_hud"], 8))
 
     def tick(self):
         pal = SESSION_PALETTE.get(self._session, SESSION_PALETTE[ECUState.SESSION_DEFAULT])
@@ -597,7 +610,7 @@ class SecurityIndicator(tk.Canvas):
                                         start=0, extent=180,
                                         outline=C["red"], width=2, style="arc")
         self._label = self.create_text(self.W//2, 9, text="LOCKED",
-                                       fill=C["red"], font=(C["font_hud"], 7, "bold"))
+                                       fill=C["red"], font=(C["font_hud"], 9, "bold"))
 
     def tick(self):
         self._phase = (self._phase + 0.05) % (2*math.pi)
@@ -674,10 +687,10 @@ class ECU_GUI:
         left.pack(side="left")
         tk.Label(left, text="◈  UDS ECU SIMULATOR",
                  bg=C["bg"], fg=C["phosphor"],
-                 font=(C["font_hud"], 13, "bold")).pack(side="left")
+                 font=(C["font_hud"], 15, "bold")).pack(side="left")
         tk.Label(left, text="  DIAGNOSTIC CONSOLE v2.0",
                  bg=C["bg"], fg=C["mid"],
-                 font=(C["font_hud"], 9)).pack(side="left", pady=4)
+                 font=(C["font_hud"], 11)).pack(side="left", pady=4)
 
         # Right — controls
         right = tk.Frame(bar, bg=C["bg"])
@@ -692,7 +705,7 @@ class ECU_GUI:
                               command=self._toggle_lockout,
                               bg=C["bg"], fg=C["mid"], selectcolor=C["bg3"],
                               activebackground=C["bg"], activeforeground=C["phosphor"],
-                              font=(C["font_hud"], 8))
+                              font=(C["font_hud"], 10))
         chk.pack(side="left", padx=6)
 
         self._make_btn(right, "CLEAR",  self._clear_logs, color=C["mid"]).pack(side="left", padx=4)
@@ -733,7 +746,7 @@ class ECU_GUI:
         graph_frame = tk.Frame(bar, bg=C["bg"])
         graph_frame.pack(side="left")
         tk.Label(graph_frame, text="CAN DENSITY", bg=C["bg"], fg=C["text_dim"],
-                 font=(C["font_hud"], 7)).pack()
+                 font=(C["font_hud"], 9)).pack()
         self.bargraph = BarGraph(graph_frame)
         self.bargraph.pack()
 
@@ -744,7 +757,7 @@ class ECU_GUI:
         self._clock_var = tk.StringVar(value="00:00:00")
         tk.Label(clock_f, textvariable=self._clock_var,
                  bg=C["bg"], fg=C["mid"],
-                 font=(C["font_hud"], 14, "bold")).pack()
+                 font=(C["font_hud"], 16, "bold")).pack()
 
         tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x", padx=8)
 
@@ -754,7 +767,7 @@ class ECU_GUI:
         row.pack(fill="x", padx=8)
 
         tk.Label(row, text="ECU STATE", bg=C["bg"], fg=C["text_dim"],
-                 font=(C["font_hud"], 7, "bold")).pack(side="left", padx=6)
+                 font=(C["font_hud"], 9, "bold")).pack(side="left", padx=6)
 
         # Session badge
         self.session_ind = SessionIndicator(row)
@@ -782,7 +795,7 @@ class ECU_GUI:
         row.pack(fill="x", padx=8, pady=2)
 
         tk.Label(row, text="MSG FLOW", bg=C["bg2"], fg=C["text_dim"],
-                 font=(C["font_hud"], 7, "bold")).pack(side="left", padx=8)
+                 font=(C["font_hud"], 9, "bold")).pack(side="left", padx=8)
 
         self.flow = FlowArrow(row)
         self.flow.pack(side="left", padx=4)
@@ -792,11 +805,11 @@ class ECU_GUI:
         msg_f = tk.Frame(row, bg=C["bg2"])
         msg_f.pack(side="left", fill="x", expand=True)
         tk.Label(msg_f, text="LAST FRAME", bg=C["bg2"], fg=C["text_dim"],
-                 font=(C["font_hud"], 7)).pack(anchor="w")
+                 font=(C["font_hud"], 9)).pack(anchor="w")
         self._last_frame_var = tk.StringVar(value="—")
         tk.Label(msg_f, textvariable=self._last_frame_var,
                  bg=C["bg2"], fg=C["phosphor"],
-                 font=(C["font_mono"], 9, "bold")).pack(anchor="w")
+                 font=(C["font_mono"], 12, "bold")).pack(anchor="w")
 
         tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x", padx=8)
 
@@ -804,12 +817,20 @@ class ECU_GUI:
         panels = tk.Frame(self.root, bg=C["bg"])
         panels.pack(fill="both", expand=True, padx=8, pady=6)
 
+        # Give every column an equal weight=1 so Tkinter divides available
+        # horizontal space in exact thirds — immune to font-size-driven minimum widths.
+        panels.columnconfigure(0, weight=1, uniform="logcol")
+        panels.columnconfigure(1, weight=1, uniform="logcol")
+        panels.columnconfigure(2, weight=1, uniform="logcol")
+        panels.rowconfigure(0, weight=1)
+
         self.log_uds_panel    = PhosphorLog(panels, title="◈ UDS DIAGNOSTIC LOG")
         self.log_can_panel    = PhosphorLog(panels, title="◈ CAN FRAME LOG")
         self.log_oracle_panel = PhosphorLog(panels, title="◈ ORACLE / VULN LOG")
 
-        for p in (self.log_uds_panel, self.log_can_panel, self.log_oracle_panel):
-            p.pack(side="left", fill="both", expand=True, padx=3)
+        self.log_uds_panel.grid(   row=0, column=0, sticky="nsew", padx=(0, 3))
+        self.log_can_panel.grid(   row=0, column=1, sticky="nsew", padx=3)
+        self.log_oracle_panel.grid(row=0, column=2, sticky="nsew", padx=(3, 0))
 
     # ──────────────────────── WIDGET FACTORIES ────────────────────────────────
 
@@ -819,7 +840,7 @@ class ECU_GUI:
         led = LED(f, color=color)
         led.pack()
         tk.Label(f, text=label, bg=C["bg"], fg=C["text_dim"],
-                 font=(C["font_hud"], 6)).pack()
+                 font=(C["font_hud"], 8)).pack()
         return led
 
     def _make_btn(self, parent, text: str, cmd, color: str = None) -> tk.Button:
@@ -828,7 +849,7 @@ class ECU_GUI:
             parent, text=text, command=cmd,
             bg=C["bg3"], fg=col, activebackground=C["border_hi"],
             activeforeground=col, relief="flat", bd=0, padx=10, pady=4,
-            font=(C["font_hud"], 8, "bold"), cursor="hand2",
+            font=(C["font_hud"], 10, "bold"), cursor="hand2",
         )
         btn.bind("<Enter>", lambda e, b=btn, c=col: b.config(fg=C["white"], bg=C["border_hi"]))
         btn.bind("<Leave>", lambda e, b=btn, c=col: b.config(fg=c, bg=C["bg3"]))
