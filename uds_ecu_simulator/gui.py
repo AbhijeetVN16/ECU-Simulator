@@ -1,8 +1,12 @@
-# gui.py
+# gui.py  —  Enhanced ECU Simulator GUI
+# Aesthetic: Industrial phosphor-terminal × automotive diagnostic telemetry
+# Animations: fully Tkinter-native, root.after() driven — zero thread blocking
 
 import time
 import os
+import math
 import threading
+import colorsys
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 import can
@@ -11,171 +15,1005 @@ from virtual_ecu import VirtualECU
 from ecu_state import ECUState
 from vulnerability_engine import VulnerabilityEngine
 
+try:
+    from logger import ECULogger
+    _elog = ECULogger("gui")
+except ImportError:
+    class _FakeLog:
+        def __getattr__(self, _): return lambda *a, **k: None
+    _elog = _FakeLog()
+
+# ─────────────────────────── PALETTE ──────────────────────────────────────────
+C = {
+    "bg":           "#080C0F",   # near-black with blue tint
+    "bg2":          "#0D1318",   # panel background
+    "bg3":          "#111820",   # slightly lighter panel
+    "border":       "#1A2530",   # subtle border
+    "border_hi":    "#243040",   # highlighted border
+    "phosphor":     "#00FF7F",   # primary green — spring green phosphor
+    "phosphor_dim": "#007040",   # dimmed phosphor
+    "phosphor_lo":  "#003820",   # very dim
+    "amber":        "#FFB300",   # amber for warnings
+    "amber_dim":    "#7A5500",
+    "red":          "#FF3040",   # error red
+    "red_dim":      "#6A0010",
+    "blue":         "#2090FF",   # DEFAULT session
+    "blue_dim":     "#0A3570",
+    "yellow":       "#FFD700",   # EXTENDED session
+    "yellow_dim":   "#5A4800",
+    "cyan":         "#00D4FF",   # accent / processing
+    "cyan_dim":     "#003A50",
+    "white":        "#E8F0F4",
+    "mid":          "#5A7080",
+    "text_dim":     "#3A5060",
+    "font_mono":    "Courier",   # authentic terminal feel
+    "font_hud":     "Courier",
+}
+
+# Session colour maps
+SESSION_PALETTE = {
+    ECUState.SESSION_DEFAULT:     {"name": "DEFAULT",     "hi": C["blue"],   "lo": C["blue_dim"],   "led": "#2090FF"},
+    ECUState.SESSION_PROGRAMMING: {"name": "PROGRAMMING", "hi": C["red"],    "lo": C["red_dim"],    "led": "#FF3040"},
+    ECUState.SESSION_EXTENDED:    {"name": "EXTENDED",    "hi": C["yellow"], "lo": C["yellow_dim"], "led": "#FFD700"},
+}
+
+# ─────────────────────────── ANIMATION ENGINE ─────────────────────────────────
+
+class Animator:
+    """Lightweight scheduler that drives all canvas animations via root.after()."""
+
+    def __init__(self, root: tk.Tk):
+        self.root   = root
+        self._tasks: list[dict] = []
+        self._running = True
+        self._tick()
+
+    def _tick(self):
+        if not self._running:
+            return
+        now = time.monotonic()
+        for t in list(self._tasks):
+            if now >= t["next"]:
+                try:
+                    keep = t["fn"]()
+                except Exception:
+                    keep = False
+                if keep is False:
+                    self._tasks.remove(t)
+                else:
+                    t["next"] = now + t["interval"]
+        self.root.after(16, self._tick)   # ~60 fps driver
+
+    def repeat(self, interval_ms: float, fn) -> dict:
+        """Schedule *fn* every interval_ms milliseconds. fn returns False to stop."""
+        task = {"fn": fn, "interval": interval_ms / 1000, "next": time.monotonic()}
+        self._tasks.append(task)
+        return task
+
+    def once(self, delay_ms: float, fn):
+        """Run *fn* once after delay_ms."""
+        def _wrap():
+            fn()
+            return False
+        self.repeat(delay_ms, _wrap)
+
+    def cancel(self, task: dict):
+        if task in self._tasks:
+            self._tasks.remove(task)
+
+    def stop(self):
+        self._running = False
+
+
+# ─────────────────────────── CANVAS WIDGETS ───────────────────────────────────
+
+class LED(tk.Canvas):
+    """Blinking LED indicator with glow halo."""
+
+    def __init__(self, parent, color: str = "#00FF7F", size: int = 14, **kw):
+        super().__init__(parent, width=size + 8, height=size + 8,
+                         bg=C["bg"], bd=0, highlightthickness=0, **kw)
+        self._color   = color
+        self._size    = size
+        self._on      = True
+        self._glow    = 0.0   # 0..1 glow intensity
+        self._phase   = 0.0
+        cx = cy = (size + 8) // 2
+        r  = size // 2
+        rg = r + 3
+        # halo (glow ring)
+        self._halo = self.create_oval(cx-rg, cy-rg, cx+rg, cy+rg,
+                                      fill="", outline="", width=0)
+        # core circle
+        self._core = self.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                      fill=color, outline=self._dim(color, 0.5), width=1)
+
+    @staticmethod
+    def _dim(hex_color: str, factor: float) -> str:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        return "#{:02x}{:02x}{:02x}".format(int(r*factor), int(g*factor), int(b*factor))
+
+    @staticmethod
+    def _blend(hex_a: str, hex_b: str, t: float) -> str:
+        def parse(h): h=h.lstrip("#"); return int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        ar,ag,ab = parse(hex_a); br,bg,bb = parse(hex_b)
+        return "#{:02x}{:02x}{:02x}".format(int(ar+(br-ar)*t), int(ag+(bg-ag)*t), int(ab+(bb-ab)*t))
+
+    def set_color(self, color: str):
+        self._color = color
+        self._redraw()
+
+    def _redraw(self):
+        if self._on:
+            core_col  = self._blend(self._dim(self._color, 0.3), self._color, self._glow)
+            halo_col  = self._dim(self._color, self._glow * 0.35)
+            out_col   = self._dim(self._color, 0.6)
+        else:
+            core_col  = self._dim(self._color, 0.12)
+            halo_col  = ""
+            out_col   = self._dim(self._color, 0.2)
+        self.itemconfig(self._core, fill=core_col, outline=out_col)
+        self.itemconfig(self._halo, fill=halo_col, outline="")
+
+    def pulse(self, speed: float = 0.06):
+        """Soft breathing pulse. Call from Animator."""
+        self._phase = (self._phase + speed) % (2 * math.pi)
+        self._glow  = 0.5 + 0.5 * math.sin(self._phase)
+        self._on    = True
+        self._redraw()
+
+    def blink_once(self, on_ms: int = 80):
+        """Flash bright for on_ms then return to dim."""
+        self._on   = True
+        self._glow = 1.0
+        self._redraw()
+        def _off():
+            self._on   = True
+            self._glow = 0.15
+            self._redraw()
+        self.after(on_ms, _off)
+
+    def set_state(self, on: bool):
+        self._on   = on
+        self._glow = 1.0 if on else 0.0
+        self._redraw()
+
+
+class Spinner(tk.Canvas):
+    """Rotating arc spinner indicating active processing."""
+
+    def __init__(self, parent, size: int = 22, color: str = "#00FF7F", **kw):
+        super().__init__(parent, width=size, height=size,
+                         bg=C["bg"], bd=0, highlightthickness=0, **kw)
+        self._size    = size
+        self._color   = color
+        self._angle   = 0
+        self._visible = False
+        cx = cy = size // 2
+        r  = cx - 3
+        # track ring
+        self._track = self.create_arc(cx-r, cy-r, cx+r, cy+r,
+                                      start=0, extent=359,
+                                      outline=self._dim(color, 0.15), width=2, style="arc")
+        # spinning arc
+        self._arc = self.create_arc(cx-r, cy-r, cx+r, cy+r,
+                                    start=0, extent=90,
+                                    outline=color, width=2, style="arc")
+        self.itemconfig(self._arc, state="hidden")
+        self.itemconfig(self._track, state="hidden")
+
+    @staticmethod
+    def _dim(hex_color: str, f: float) -> str:
+        h=hex_color.lstrip("#"); r,g,b=int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        return "#{:02x}{:02x}{:02x}".format(int(r*f),int(g*f),int(b*f))
+
+    def spin(self):
+        """Advance one animation frame. Call from Animator."""
+        if not self._visible:
+            return
+        self._angle = (self._angle - 12) % 360
+        tail_len = 110 + 30 * math.sin(math.radians(self._angle * 2))
+        self.itemconfig(self._arc, start=self._angle, extent=int(tail_len))
+
+    def show(self):
+        self._visible = True
+        self.itemconfig(self._arc,   state="normal")
+        self.itemconfig(self._track, state="normal")
+
+    def hide(self):
+        self._visible = False
+        self.itemconfig(self._arc,   state="hidden")
+        self.itemconfig(self._track, state="hidden")
+
+
+class FlowArrow(tk.Canvas):
+    """Animated tester → ECU → response message-flow diagram."""
+
+    W, H = 520, 46
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=C["bg2"], bd=0, highlightthickness=0, **kw)
+        self._particles: list[dict] = []
+        self._active    = False
+        self._direction = 1   # 1 = left→right (TX),  -1 = right→left (RX response)
+        self._color     = C["phosphor"]
+        self._build_static()
+
+    def _build_static(self):
+        W, H = self.W, self.H
+        mid   = H // 2
+        # Labels
+        self.create_text(10, mid, text="TESTER", fill=C["mid"],
+                         font=(C["font_hud"], 8, "bold"), anchor="w")
+        self.create_text(W-10, mid, text="ECU", fill=C["mid"],
+                         font=(C["font_hud"], 8, "bold"), anchor="e")
+        # Static track line
+        lx1, lx2 = 60, W - 50
+        self._track_line = self.create_line(lx1, mid, lx2, mid,
+                                            fill=C["border_hi"], width=1, dash=(4,4))
+        # Node circles
+        self._node_t = self.create_oval(52,mid-7, 68,mid+7, fill=C["bg3"], outline=C["border_hi"], width=1)
+        self._node_e = self.create_oval(W-67,mid-7, W-51,mid+7, fill=C["bg3"], outline=C["border_hi"], width=1)
+        # Direction arrow head (repositioned dynamically)
+        self._arrowhead = self.create_polygon(0,0,0,0,0,0, fill=C["phosphor"], state="hidden")
+        # Particle dots
+        self._dots = [
+            self.create_oval(0,0,0,0, fill=C["phosphor"], outline="", state="hidden")
+            for _ in range(6)
+        ]
+        # Direction label
+        self._dir_label = self.create_text(W//2, 8, text="", fill=C["phosphor_dim"],
+                                           font=(C["font_hud"], 7), anchor="center")
+
+    def _update_particles(self):
+        W, H = self.W, self.H
+        mid   = H // 2
+        lx1, lx2 = 62, W - 52
+        track_len = lx2 - lx1
+        still_alive = []
+        for p in self._particles:
+            p["t"] += p["speed"]
+            if p["t"] > 1.2:
+                self.itemconfig(p["dot"], state="hidden")
+                continue
+            t_clamped = max(0, min(1, p["t"]))
+            x  = lx1 + track_len * t_clamped if self._direction == 1 else lx2 - track_len * t_clamped
+            alpha = 1.0 - abs(p["t"] - 0.5) * 2
+            alpha = max(0, alpha)
+            size = int(3 + 3 * alpha)
+            col  = self._fade_color(self._color, alpha)
+            self.coords(p["dot"], x-size, mid-size, x+size, mid+size)
+            self.itemconfig(p["dot"], fill=col, state="normal")
+            still_alive.append(p)
+        self._particles = still_alive
+
+    @staticmethod
+    def _fade_color(hex_color: str, alpha: float) -> str:
+        h=hex_color.lstrip("#"); r,g,b=int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        bg_r,bg_g,bg_b=13,19,24
+        return "#{:02x}{:02x}{:02x}".format(
+            int(bg_r + (r-bg_r)*alpha), int(bg_g + (g-bg_g)*alpha), int(bg_b + (b-bg_b)*alpha))
+
+    def tick(self):
+        self._update_particles()
+
+    def fire(self, direction: int = 1, color: str = None, label: str = ""):
+        """Spawn a burst of particles. direction: 1=TX  -1=RX."""
+        self._direction = direction
+        self._color     = color or C["phosphor"]
+        self.itemconfig(self._dir_label, text=label, fill=self._color)
+        for i, dot in enumerate(self._dots):
+            self._particles.append({
+                "dot":   dot,
+                "t":     -i * 0.07,
+                "speed": 0.045 + i * 0.004,
+            })
+
+
+class BarGraph(tk.Canvas):
+    """Mini live bar graph for CAN traffic density."""
+
+    BARS, W, H = 30, 180, 36
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=C["bg2"], bd=0, highlightthickness=0, **kw)
+        self._values = [0] * self.BARS
+        self._rects  = []
+        bw = self.W / self.BARS
+        for i in range(self.BARS):
+            x0 = i * bw + 1
+            x1 = x0 + bw - 2
+            r  = self.create_rectangle(x0, self.H, x1, self.H, fill=C["phosphor_lo"], outline="")
+            self._rects.append(r)
+
+    def push(self, value: float):
+        self._values.append(min(value, 1.0))
+        if len(self._values) > self.BARS:
+            self._values.pop(0)
+
+    def redraw(self):
+        for i, (rect, val) in enumerate(zip(self._rects, self._values)):
+            h   = int(val * (self.H - 4)) + 2
+            x0, _, x1, _ = self.coords(rect)
+            self.coords(rect, x0, self.H - h, x1, self.H)
+            # colour by intensity
+            if val > 0.7:   col = C["amber"]
+            elif val > 0.4: col = C["phosphor"]
+            else:           col = C["phosphor_dim"]
+            self.itemconfig(rect, fill=col)
+
+
+# ─────────────────────────── STYLED LOG WIDGET ────────────────────────────────
+
+class PhosphorLog(tk.Frame):
+    """ScrolledText log panel with highlight-flash on new entries."""
+
+    # Tag name → base colour
+    TAG_STYLES = {
+        "normal":  C["phosphor"],
+        "warn":    C["amber"],
+        "error":   C["red"],
+        "oracle":  "#FFD700",
+        "system":  C["cyan"],
+        "rx":      C["phosphor"],
+        "tx":      "#80FFB0",
+        "dim":     C["phosphor_dim"],
+    }
+    FLASH_COLOR = "#FFFFFF"
+    FLASH_MS    = 120
+
+    def __init__(self, parent, title: str = "", **kw):
+        super().__init__(parent, bg=C["bg2"], **kw)
+        # header
+        hdr = tk.Frame(self, bg=C["bg2"], pady=2)
+        hdr.pack(fill="x")
+        self._title_var = tk.StringVar(value=title)
+        tk.Label(hdr, textvariable=self._title_var,
+                 bg=C["bg2"], fg=C["mid"],
+                 font=(C["font_hud"], 8, "bold")).pack(side="left", padx=6)
+        self._count_var = tk.StringVar(value="0 msgs")
+        tk.Label(hdr, textvariable=self._count_var,
+                 bg=C["bg2"], fg=C["text_dim"],
+                 font=(C["font_hud"], 7)).pack(side="right", padx=6)
+        # canvas border
+        border = tk.Frame(self, bg=C["border"], padx=1, pady=1)
+        border.pack(fill="both", expand=True, padx=4, pady=(0,4))
+        self._text = tk.Text(border, bg=C["bg"], fg=C["phosphor"],
+                             insertbackground=C["phosphor"],
+                             font=(C["font_mono"], 9),
+                             wrap="none", bd=0, relief="flat",
+                             selectbackground=C["border_hi"],
+                             selectforeground=C["white"])
+        sb = tk.Scrollbar(border, orient="vertical", command=self._text.yview,
+                          bg=C["bg3"], troughcolor=C["bg"], width=8)
+        self._text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._text.pack(side="left", fill="both", expand=True)
+
+        # configure tags
+        for tag, col in self.TAG_STYLES.items():
+            self._text.tag_config(tag, foreground=col)
+        self._text.tag_config("flash", background=C["border_hi"], foreground=C["white"])
+        self._text.tag_config("flash_hi", background="#203A28", foreground=C["phosphor"])
+
+        self._count  = 0
+        self._parent = parent
+
+    def _classify(self, msg: str) -> str:
+        m = msg.upper()
+        if any(x in m for x in ("[ERR]", "[FAILURE]", "CRASH", "FAULT")):
+            return "error"
+        if any(x in m for x in ("[WARN]", "[WRN]", "WARN", "VULN", "OVERFLOW")):
+            return "warn"
+        if "[SYSTEM]" in m or "[INIT]" in m or "[CONFIG]" in m:
+            return "system"
+        if "[TX]" in m:
+            return "tx"
+        if "[RX]" in m:
+            return "rx"
+        return "normal"
+
+    def append(self, msg: str, tag: str = None):
+        ts   = time.strftime("%H:%M:%S")
+        line = f"[{ts}]  {msg}\n"
+        tag  = tag or self._classify(msg)
+
+        self._text.config(state="normal")
+        start = self._text.index("end-1c")
+        self._text.insert("end", line, (tag,))
+        end   = self._text.index("end-1c")
+
+        # flash highlight
+        flash_tag = f"fl_{self._count}"
+        self._text.tag_config(flash_tag, background="#1A3025", foreground=C["white"])
+        self._text.tag_add(flash_tag, start, end)
+        self._text.after(self.FLASH_MS, lambda t=flash_tag: self._clear_flash(t))
+
+        self._text.config(state="disabled")
+        self._text.see("end")
+
+        self._count += 1
+        self._count_var.set(f"{self._count} msgs")
+
+    def _clear_flash(self, tag: str):
+        try:
+            self._text.tag_delete(tag)
+        except Exception:
+            pass
+
+    def clear(self):
+        self._text.config(state="normal")
+        self._text.delete("1.0", "end")
+        self._text.config(state="disabled")
+        self._count = 0
+        self._count_var.set("0 msgs")
+
+
+# ─────────────────────────── STAT BADGE ───────────────────────────────────────
+
+class StatBadge(tk.Frame):
+    """Glowing labelled value badge for the HUD bar."""
+
+    def __init__(self, parent, label: str, initial: str = "—",
+                 color: str = None, **kw):
+        super().__init__(parent, bg=C["bg"], padx=8, pady=3, **kw)
+        self._color  = color or C["mid"]
+        tk.Label(self, text=label, bg=C["bg"], fg=C["text_dim"],
+                 font=(C["font_hud"], 7)).pack()
+        self._val_var = tk.StringVar(value=initial)
+        self._val_lbl = tk.Label(self, textvariable=self._val_var,
+                                 bg=C["bg"], fg=self._color,
+                                 font=(C["font_hud"], 11, "bold"))
+        self._val_lbl.pack()
+
+    def set(self, value: str, color: str = None):
+        self._val_var.set(value)
+        if color:
+            self._color = color
+            self._val_lbl.config(fg=color)
+
+    def flash(self):
+        orig = self._color
+        self._val_lbl.config(fg=C["white"])
+        self.after(120, lambda: self._val_lbl.config(fg=orig))
+
+
+# ─────────────────────────── COUNTER DISPLAY ──────────────────────────────────
+
+class CounterBox(tk.Frame):
+    """Three animated integer counters."""
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=C["bg"], **kw)
+        self._can_n   = self._make("CAN FRAMES",  C["phosphor"])
+        self._uds_n   = self._make("UDS REQUESTS", C["cyan"])
+        self._vuln_n  = self._make("VULNS HIT",   C["amber"])
+        self.can_count  = 0
+        self.uds_count  = 0
+        self.vuln_count = 0
+
+    def _make(self, label: str, color: str) -> dict:
+        f = tk.Frame(self, bg=C["bg3"], padx=10, pady=4,
+                     relief="flat", bd=0)
+        f.pack(side="left", padx=3)
+        tk.Frame(f, bg=color, height=2).pack(fill="x")
+        v = tk.StringVar(value="0")
+        tk.Label(f, textvariable=v, bg=C["bg3"], fg=color,
+                 font=(C["font_hud"], 16, "bold")).pack()
+        tk.Label(f, text=label, bg=C["bg3"], fg=C["mid"],
+                 font=(C["font_hud"], 7)).pack()
+        return {"var": v, "widget": f, "color": color}
+
+    def bump_can(self):
+        self.can_count += 1
+        self._can_n["var"].set(str(self.can_count))
+        self._flash(self._can_n)
+
+    def bump_uds(self):
+        self.uds_count += 1
+        self._uds_n["var"].set(str(self.uds_count))
+        self._flash(self._uds_n)
+
+    def bump_vuln(self):
+        self.vuln_count += 1
+        self._vuln_n["var"].set(str(self.vuln_count))
+        self._flash(self._vuln_n)
+
+    @staticmethod
+    def _flash(d: dict):
+        lbl = d["widget"].winfo_children()[1]   # the number label
+        lbl.config(fg=C["white"])
+        lbl.after(150, lambda: lbl.config(fg=d["color"]))
+
+
+# ─────────────────────────── SESSION INDICATOR ────────────────────────────────
+
+class SessionIndicator(tk.Canvas):
+    """Animated session badge that morphs colour on state change."""
+
+    W, H = 160, 38
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=C["bg"], bd=0, highlightthickness=0, **kw)
+        self._session = ECUState.SESSION_DEFAULT
+        self._phase   = 0.0
+        self._bg_rect = self.create_rectangle(2, 2, self.W-2, self.H-2,
+                                              fill=C["blue_dim"], outline=C["blue"],
+                                              width=1)
+        self._label   = self.create_text(self.W//2, self.H//2 - 5,
+                                         text="DEFAULT",
+                                         fill=C["blue"], font=(C["font_hud"], 9, "bold"))
+        self._sub     = self.create_text(self.W//2, self.H//2 + 8,
+                                         text="SESSION", fill=C["mid"],
+                                         font=(C["font_hud"], 7))
+
+    def tick(self):
+        pal = SESSION_PALETTE.get(self._session, SESSION_PALETTE[ECUState.SESSION_DEFAULT])
+        self._phase = (self._phase + 0.04) % (2 * math.pi)
+        glow = 0.55 + 0.45 * math.sin(self._phase)
+        # lerp fill brightness
+        lo  = pal["lo"]
+        hi  = pal["hi"]
+        col = self._lerp(lo, hi, glow * 0.5)
+        self.itemconfig(self._bg_rect, fill=col, outline=pal["hi"])
+        self.itemconfig(self._label, fill=pal["hi"])
+
+    def set_session(self, session: int):
+        self._session = session
+        pal = SESSION_PALETTE.get(session, SESSION_PALETTE[ECUState.SESSION_DEFAULT])
+        self.itemconfig(self._label, text=pal["name"])
+
+    @staticmethod
+    def _lerp(hex_a: str, hex_b: str, t: float) -> str:
+        def p(h): h=h.lstrip("#"); return int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        ar,ag,ab=p(hex_a); br,bg,bb=p(hex_b)
+        return "#{:02x}{:02x}{:02x}".format(int(ar+(br-ar)*t),int(ag+(bg-ag)*t),int(ab+(bb-ab)*t))
+
+
+# ─────────────────────────── SECURITY INDICATOR ───────────────────────────────
+
+class SecurityIndicator(tk.Canvas):
+    """Lock icon that animates unlock/lock transitions."""
+
+    W, H = 100, 38
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=C["bg"], bd=0, highlightthickness=0, **kw)
+        self._locked = True
+        self._phase  = 0.0
+        self._bg = self.create_rectangle(2,2,self.W-2,self.H-2,
+                                         fill=C["red_dim"], outline=C["red"], width=1)
+        # Lock body
+        cx, cy = self.W//2, self.H//2 + 4
+        self._body = self.create_rectangle(cx-8,cy-5, cx+8,cy+7,
+                                           fill=C["red"], outline="", width=0)
+        # Lock shackle (arc)
+        self._shackle = self.create_arc(cx-6, cy-14, cx+6, cy-4,
+                                        start=0, extent=180,
+                                        outline=C["red"], width=2, style="arc")
+        self._label = self.create_text(self.W//2, 9, text="LOCKED",
+                                       fill=C["red"], font=(C["font_hud"], 7, "bold"))
+
+    def tick(self):
+        self._phase = (self._phase + 0.05) % (2*math.pi)
+        glow = 0.5 + 0.5*math.sin(self._phase)
+        if self._locked:
+            col  = self._lerp(C["red_dim"], C["red"], glow*0.6)
+            fill = self._lerp(C["red_dim"], C["red"], glow*0.8)
+            self.itemconfig(self._bg,     fill=col, outline=C["red"])
+            self.itemconfig(self._body,   fill=fill)
+            self.itemconfig(self._shackle, outline=fill)
+            self.itemconfig(self._label,  text="LOCKED", fill=C["red"])
+        else:
+            col  = self._lerp(C["bg3"], C["phosphor_dim"], glow*0.4)
+            self.itemconfig(self._bg,     fill=col, outline=C["phosphor_dim"])
+            self.itemconfig(self._body,   fill=C["phosphor_dim"])
+            self.itemconfig(self._shackle, outline=C["phosphor_dim"])
+            self.itemconfig(self._label,  text="UNLOCKED", fill=C["phosphor"])
+
+    def set_locked(self, locked: bool):
+        self._locked = locked
+
+    @staticmethod
+    def _lerp(hex_a:str, hex_b:str, t:float) -> str:
+        def p(h): h=h.lstrip("#"); return int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+        ar,ag,ab=p(hex_a); br,bg,bb=p(hex_b)
+        return "#{:02x}{:02x}{:02x}".format(int(ar+(br-ar)*t),int(ag+(bg-ag)*t),int(ab+(bb-ab)*t))
+
+
+# ─────────────────────────── MAIN GUI CLASS ───────────────────────────────────
+
 class ECU_GUI:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("UDS ECU Simulator")
-        self.root.geometry("1500x780")
+        self.root.title("UDS ECU Simulator  ·  Diagnostic Console")
+        self.root.geometry("1560x900")
+        self.root.configure(bg=C["bg"])
+        self.root.resizable(True, True)
 
-        self._build_style()
-        self._build_layout()
+        # throttle tracking
+        self._last_can_time   = 0.0
+        self._can_rate_bucket = 0
 
+        self._build_ui()
+
+        # Start ECU
+        _elog.info("[INIT] Building ECU_GUI and starting VirtualECU")
         self.ecu = VirtualECU(self.log_uds, self.log_raw_can, self.log_oracle)
 
-        self.thread = threading.Thread(target=self.ecu.start, daemon=True)
-        self.thread.start()
+        self.ecu_thread = threading.Thread(target=self.ecu.start, daemon=True)
+        self.ecu_thread.start()
 
-        self.root.after(200, self._refresh_status)
+        # Animation engine
+        self.anim = Animator(self.root)
+        self._start_animations()
 
-    def _build_style(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("Title.TLabel", font=("Consolas", 14, "bold"))
-        style.configure("Stat.TLabel", font=("Consolas", 11, "bold"))
+        # Status polling
+        self.root.after(250, self._poll_status)
 
-    def _build_layout(self):
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", padx=10, pady=8)
+    # ──────────────────────── UI BUILD ────────────────────────────────────────
 
-        ttk.Label(top, text="UDS ECU Simulator", style="Title.TLabel").pack(side="left")
+    def _build_ui(self):
+        self._build_title_bar()
+        self._build_status_bar()
+        self._build_ecu_state_row()
+        self._build_flow_row()
+        self._build_log_panels()
 
-        ctrl = ttk.Frame(top)
-        ctrl.pack(side="right")
+    def _build_title_bar(self):
+        bar = tk.Frame(self.root, bg=C["bg"], pady=6)
+        bar.pack(fill="x", padx=8)
 
-        ttk.Button(ctrl, text="Load JSON", command=self._load_vulnerability_file).pack(side="left", padx=8)
+        # Left — title
+        left = tk.Frame(bar, bg=C["bg"])
+        left.pack(side="left")
+        tk.Label(left, text="◈  UDS ECU SIMULATOR",
+                 bg=C["bg"], fg=C["phosphor"],
+                 font=(C["font_hud"], 13, "bold")).pack(side="left")
+        tk.Label(left, text="  DIAGNOSTIC CONSOLE v2.0",
+                 bg=C["bg"], fg=C["mid"],
+                 font=(C["font_hud"], 9)).pack(side="left", pady=4)
+
+        # Right — controls
+        right = tk.Frame(bar, bg=C["bg"])
+        right.pack(side="right")
+
+        self._make_btn(right, "LOAD JSON",   self._load_vulnerability_file).pack(side="left", padx=4)
+        self._make_btn(right, "EXPORT LOG",  self._export_log).pack(side="left", padx=4)
 
         self.var_persistent = tk.BooleanVar(value=False)
-        ttk.Checkbutton(ctrl, text="Persistent Lockout", variable=self.var_persistent,
-                        command=self._toggle_lockout).pack(side="left", padx=8)
+        chk = tk.Checkbutton(right, text="PERSIST LOCKOUT",
+                              variable=self.var_persistent,
+                              command=self._toggle_lockout,
+                              bg=C["bg"], fg=C["mid"], selectcolor=C["bg3"],
+                              activebackground=C["bg"], activeforeground=C["phosphor"],
+                              font=(C["font_hud"], 8))
+        chk.pack(side="left", padx=6)
 
-        ttk.Button(ctrl, text="Clear Logs", command=self._clear_logs).pack(side="left", padx=8)
-        ttk.Button(ctrl, text="Exit", command=self._exit).pack(side="left")
+        self._make_btn(right, "CLEAR",  self._clear_logs, color=C["mid"]).pack(side="left", padx=4)
+        self._make_btn(right, "EXIT",   self._exit, color=C["red"]).pack(side="left", padx=4)
 
-        stat = ttk.LabelFrame(self.root, text="ECU State")
-        stat.pack(fill="x", padx=10, pady=6)
+        # Thin accent line
+        tk.Frame(self.root, bg=C["phosphor_lo"], height=1).pack(fill="x", padx=8)
 
-        self.lbl_session = ttk.Label(stat, text="Session: DEFAULT", style="Stat.TLabel")
-        self.lbl_session.pack(side="left", padx=10)
+    def _build_status_bar(self):
+        """LED status indicators + counters."""
+        bar = tk.Frame(self.root, bg=C["bg"], pady=6)
+        bar.pack(fill="x", padx=8)
 
-        self.lbl_security = ttk.Label(stat, text="Security: LOCKED", style="Stat.TLabel")
-        self.lbl_security.pack(side="left", padx=10)
+        # ── LEDs ─────────────────────────────────────────────────────────────
+        led_frame = tk.Frame(bar, bg=C["bg"])
+        led_frame.pack(side="left")
 
-        self.lbl_attempts = ttk.Label(stat, text="Attempts: 0/3", style="Stat.TLabel")
-        self.lbl_attempts.pack(side="left", padx=10)
+        self.led_can    = self._make_led_block(led_frame, "CAN BUS",    C["phosphor"])
+        self.led_ecu    = self._make_led_block(led_frame, "ECU",        C["cyan"])
+        self.led_proc   = self._make_led_block(led_frame, "PROCESSING", C["amber"])
+        self.led_vuln   = self._make_led_block(led_frame, "VULN DET",   C["red"])
 
-        self.lbl_boot = ttk.Label(stat, text="Boot: 0", style="Stat.TLabel")
-        self.lbl_boot.pack(side="left", padx=10)
+        # ── Spinner ───────────────────────────────────────────────────────────
+        spin_f = tk.Frame(bar, bg=C["bg"], padx=6)
+        spin_f.pack(side="left")
+        self.spinner = Spinner(spin_f, size=26, color=C["cyan"])
+        self.spinner.pack()
 
-        self.lbl_fault = ttk.Label(stat, text="Fault: NO", style="Stat.TLabel")
-        self.lbl_fault.pack(side="left", padx=10)
+        # Separator
+        tk.Frame(bar, bg=C["border"], width=1).pack(side="left", fill="y", padx=8, pady=2)
 
-        main = ttk.Frame(self.root)
-        main.pack(fill="both", expand=True, padx=10, pady=8)
+        # ── Counters ──────────────────────────────────────────────────────────
+        self.counters = CounterBox(bar)
+        self.counters.pack(side="left", padx=4)
 
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        # ── Bar graph ─────────────────────────────────────────────────────────
+        tk.Frame(bar, bg=C["border"], width=1).pack(side="left", fill="y", padx=8, pady=2)
+        graph_frame = tk.Frame(bar, bg=C["bg"])
+        graph_frame.pack(side="left")
+        tk.Label(graph_frame, text="CAN DENSITY", bg=C["bg"], fg=C["text_dim"],
+                 font=(C["font_hud"], 7)).pack()
+        self.bargraph = BarGraph(graph_frame)
+        self.bargraph.pack()
 
-        mid = ttk.Frame(main)
-        mid.pack(side="left", fill="both", expand=True, padx=(6, 6))
+        # ── Clock ─────────────────────────────────────────────────────────────
+        tk.Frame(bar, bg=C["border"], width=1).pack(side="right", fill="y", padx=8, pady=2)
+        clock_f = tk.Frame(bar, bg=C["bg"])
+        clock_f.pack(side="right")
+        self._clock_var = tk.StringVar(value="00:00:00")
+        tk.Label(clock_f, textvariable=self._clock_var,
+                 bg=C["bg"], fg=C["mid"],
+                 font=(C["font_hud"], 14, "bold")).pack()
 
-        right = ttk.Frame(main)
-        right.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x", padx=8)
 
-        uds_frame = ttk.LabelFrame(left, text="UDS Log")
-        uds_frame.pack(fill="both", expand=True)
+    def _build_ecu_state_row(self):
+        """Session / security / fault / boot counters."""
+        row = tk.Frame(self.root, bg=C["bg"], pady=5)
+        row.pack(fill="x", padx=8)
 
-        self.uds_console = scrolledtext.ScrolledText(
-            uds_frame, bg="black", fg="#00FF00", insertbackground="white",
-            font=("Consolas", 10)
+        tk.Label(row, text="ECU STATE", bg=C["bg"], fg=C["text_dim"],
+                 font=(C["font_hud"], 7, "bold")).pack(side="left", padx=6)
+
+        # Session badge
+        self.session_ind = SessionIndicator(row)
+        self.session_ind.pack(side="left", padx=6)
+
+        # Security badge
+        self.security_ind = SecurityIndicator(row)
+        self.security_ind.pack(side="left", padx=6)
+
+        # Stat badges
+        self.badge_boot    = StatBadge(row, "BOOT COUNT", "0",  color=C["mid"])
+        self.badge_boot.pack(side="left", padx=4)
+        self.badge_fault   = StatBadge(row, "FAULT",     "—",  color=C["phosphor"])
+        self.badge_fault.pack(side="left", padx=4)
+        self.badge_attempt = StatBadge(row, "AUTH ATTEMPTS", "0/3", color=C["mid"])
+        self.badge_attempt.pack(side="left", padx=4)
+        self.badge_p2      = StatBadge(row, "P2 TIMEOUT", "50ms", color=C["mid"])
+        self.badge_p2.pack(side="left", padx=4)
+
+        tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x", padx=8)
+
+    def _build_flow_row(self):
+        """CAN message flow animation."""
+        row = tk.Frame(self.root, bg=C["bg2"], pady=4)
+        row.pack(fill="x", padx=8, pady=2)
+
+        tk.Label(row, text="MSG FLOW", bg=C["bg2"], fg=C["text_dim"],
+                 font=(C["font_hud"], 7, "bold")).pack(side="left", padx=8)
+
+        self.flow = FlowArrow(row)
+        self.flow.pack(side="left", padx=4)
+
+        # Right side — last message preview
+        tk.Frame(row, bg=C["border"], width=1).pack(side="left", fill="y", padx=8, pady=4)
+        msg_f = tk.Frame(row, bg=C["bg2"])
+        msg_f.pack(side="left", fill="x", expand=True)
+        tk.Label(msg_f, text="LAST FRAME", bg=C["bg2"], fg=C["text_dim"],
+                 font=(C["font_hud"], 7)).pack(anchor="w")
+        self._last_frame_var = tk.StringVar(value="—")
+        tk.Label(msg_f, textvariable=self._last_frame_var,
+                 bg=C["bg2"], fg=C["phosphor"],
+                 font=(C["font_mono"], 9, "bold")).pack(anchor="w")
+
+        tk.Frame(self.root, bg=C["border"], height=1).pack(fill="x", padx=8)
+
+    def _build_log_panels(self):
+        panels = tk.Frame(self.root, bg=C["bg"])
+        panels.pack(fill="both", expand=True, padx=8, pady=6)
+
+        self.log_uds_panel    = PhosphorLog(panels, title="◈ UDS DIAGNOSTIC LOG")
+        self.log_can_panel    = PhosphorLog(panels, title="◈ CAN FRAME LOG")
+        self.log_oracle_panel = PhosphorLog(panels, title="◈ ORACLE / VULN LOG")
+
+        for p in (self.log_uds_panel, self.log_can_panel, self.log_oracle_panel):
+            p.pack(side="left", fill="both", expand=True, padx=3)
+
+    # ──────────────────────── WIDGET FACTORIES ────────────────────────────────
+
+    def _make_led_block(self, parent, label: str, color: str) -> LED:
+        f = tk.Frame(parent, bg=C["bg"], padx=6)
+        f.pack(side="left")
+        led = LED(f, color=color)
+        led.pack()
+        tk.Label(f, text=label, bg=C["bg"], fg=C["text_dim"],
+                 font=(C["font_hud"], 6)).pack()
+        return led
+
+    def _make_btn(self, parent, text: str, cmd, color: str = None) -> tk.Button:
+        col = color or C["phosphor_dim"]
+        btn = tk.Button(
+            parent, text=text, command=cmd,
+            bg=C["bg3"], fg=col, activebackground=C["border_hi"],
+            activeforeground=col, relief="flat", bd=0, padx=10, pady=4,
+            font=(C["font_hud"], 8, "bold"), cursor="hand2",
         )
-        self.uds_console.pack(fill="both", expand=True)
+        btn.bind("<Enter>", lambda e, b=btn, c=col: b.config(fg=C["white"], bg=C["border_hi"]))
+        btn.bind("<Leave>", lambda e, b=btn, c=col: b.config(fg=c, bg=C["bg3"]))
+        return btn
 
-        raw_frame = ttk.LabelFrame(mid, text="CAN Log")
-        raw_frame.pack(fill="both", expand=True)
+    # ──────────────────────── ANIMATION LOOP ──────────────────────────────────
 
-        self.raw_console = scrolledtext.ScrolledText(
-            raw_frame, bg="black", fg="#00FF00", insertbackground="white",
-            font=("Consolas", 10)
-        )
-        self.raw_console.pack(fill="both", expand=True)
+    def _start_animations(self):
+        a = self.anim
 
-        oracle_frame = ttk.LabelFrame(right, text="Oracle Log")
-        oracle_frame.pack(fill="both", expand=True)
+        # LED breathing animations
+        a.repeat(30, self.led_can.pulse)
+        a.repeat(40, lambda: self.led_ecu.pulse(speed=0.03))
 
-        self.oracle_console = scrolledtext.ScrolledText(
-            oracle_frame, bg="black", fg="#FFD700", insertbackground="white",
-            font=("Consolas", 10)
-        )
-        self.oracle_console.pack(fill="both", expand=True)
+        # Spinner
+        a.repeat(25, self.spinner.spin)
+        self.spinner.hide()   # shown only when actively processing
+
+        # Session + security badge animation
+        a.repeat(30, self.session_ind.tick)
+        a.repeat(40, self.security_ind.tick)
+
+        # Flow arrow
+        a.repeat(25, self.flow.tick)
+
+        # Bar graph redraw
+        a.repeat(120, self.bargraph.redraw)
+
+        # CAN density bucket flusher (1/s)
+        a.repeat(1000, self._flush_can_bucket)
+
+        # Clock update
+        a.repeat(1000, self._update_clock)
+
+    def _flush_can_bucket(self):
+        rate = min(1.0, self._can_rate_bucket / 20.0)
+        self.bargraph.push(rate)
+        self._can_rate_bucket = 0
+
+    def _update_clock(self):
+        self._clock_var.set(time.strftime("%H:%M:%S"))
+
+    # ──────────────────────── LOG CALLBACKS ───────────────────────────────────
+
+    def log_uds(self, msg: str):
+        self.root.after(0, lambda: self._append_uds(msg))
+
+    def _append_uds(self, msg: str):
+        self.log_uds_panel.append(msg)
+        self.counters.bump_uds()
+        # Flash processing LED briefly
+        self.spinner.show()
+        self.led_proc.blink_once(on_ms=200)
+        self.root.after(400, self.spinner.hide)
+        # Fire flow arrow
+        if "[RX]" in msg.upper() or "[RX][UDS]" in msg.upper():
+            self.flow.fire(direction=1, color=C["phosphor"], label="TESTER → ECU")
+        elif "[TX]" in msg.upper() or "[TX][UDS]" in msg.upper():
+            self.flow.fire(direction=-1, color=C["cyan"], label="ECU → TESTER")
+        # File logger
+        skip = ("[RX][UDS]","[TX][UDS]","[WARN]","[ERR]","[FAILURE]","[VULN]","[STATE]")
+        if not any(msg.startswith(p) for p in skip):
+            _elog.info(msg)
+
+    def log_raw_can(self, msg: can.Message):
+        self.root.after(0, lambda m=msg: self._append_can(m))
+
+    def _append_can(self, msg: can.Message):
+        line = (f"ID={msg.arbitration_id:03X}  DLC={msg.dlc}"
+                f"  {msg.data.hex().upper()}")
+        self.log_can_panel.append(line)
+        self._last_frame_var.set(f"0x{msg.arbitration_id:03X}  {msg.data.hex().upper()}")
+        self.counters.bump_can()
+        self.led_can.blink_once(on_ms=60)
+        self._can_rate_bucket += 1
+        _elog.debug(f"[CAN] {line}")
+
+    def log_oracle(self, msg: str):
+        self.root.after(0, lambda: self._append_oracle(msg))
+
+    def _append_oracle(self, msg: str):
+        self.log_oracle_panel.append(msg, tag="oracle")
+        self.counters.bump_vuln()
+        # Danger flash
+        self.led_vuln.blink_once(on_ms=350)
+        self.flow.fire(direction=1, color=C["amber"], label="⚡ VULN TRIGGERED")
+        _elog.warning(f"[ORACLE] {msg}")
+
+    # ──────────────────────── STATUS POLLING ──────────────────────────────────
+
+    def _poll_status(self):
+        try:
+            st  = self.ecu.state
+            nvm = self.ecu.nvm
+
+            # Session
+            if self.session_ind._session != st.session:
+                self.session_ind.set_session(st.session)
+                pal = SESSION_PALETTE.get(st.session, SESSION_PALETTE[ECUState.SESSION_DEFAULT])
+                self.led_ecu.set_color(pal["led"])
+
+            # Security
+            locked = st.security_level == 0
+            self.security_ind.set_locked(locked)
+
+            # Fault
+            if st.faulted:
+                self.badge_fault.set(st.fault_reason or "YES", color=C["red"])
+                self.led_ecu.set_color(C["red"])
+            else:
+                self.badge_fault.set("—", color=C["phosphor"])
+
+            # Boot count
+            boot = nvm.store.get("boot_count", 0)
+            self.badge_boot.set(str(boot))
+
+            # Auth attempts
+            attempts = (nvm.store.get("persistent_auth_failures",0)
+                        if st.persistent_lockout else st.auth_failures_ram)
+            attempt_str = f"{attempts}/{st.max_attempts}"
+            col = C["red"] if attempts >= st.max_attempts else (C["amber"] if attempts > 0 else C["mid"])
+            self.badge_attempt.set(attempt_str, color=col)
+
+            # P2 timeout
+            self.badge_p2.set(f"{st.p2_ms}ms")
+
+        except Exception as exc:
+            _elog.warning(f"[GUI] Status poll error: {exc}")
+
+        self.root.after(250, self._poll_status)
+
+    # ──────────────────────── CONTROLS ────────────────────────────────────────
 
     def _load_vulnerability_file(self):
         path = filedialog.askopenfilename(
-            title="Select JSON",
-            filetypes=(("JSON files", "*.json"), ("all files", "*.*"))
+            title="Select Vulnerability JSON",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
         )
-
         if not path:
             return
-
-        self.log_uds(f"[SYSTEM] Selected JSON: {os.path.basename(path)}")
-
+        self.log_uds(f"[SYSTEM] Loading: {os.path.basename(path)}")
+        _elog.info(f"[CONFIG] Loading vulnerability file: {path}")
         self.ecu.cfg.path = path
-
         if self.ecu.cfg.load():
             self.ecu.apply_cfg()
-            self.ecu.vuln_engine = VulnerabilityEngine(self.ecu.cfg, self.ecu.state, self.ecu.log, self.ecu.oracle)
-            self.log_uds(f"[SYSTEM] Reloaded {len(self.ecu.cfg.vulnerabilities)} vulnerabilities")
+            self.ecu.vuln_engine = VulnerabilityEngine(
+                self.ecu.cfg, self.ecu.state, self.ecu.log, self.ecu.oracle)
+            n = len(self.ecu.cfg.vulnerabilities)
+            self.log_uds(f"[SYSTEM] Reloaded {n} vulnerabilities")
+            _elog.info(f"[CONFIG] Reloaded {n} vulnerabilities")
         else:
             self.log_uds("[SYSTEM][ERR] Failed to load JSON")
+            _elog.error(f"[CONFIG] Failed to load JSON from {path}")
 
     def _toggle_lockout(self):
-        self.ecu.state.persistent_lockout = self.var_persistent.get()
-
-    def log_uds(self, msg):
-        self.uds_console.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        self.uds_console.see(tk.END)
-
-    def log_raw_can(self, msg: can.Message):
-        self.raw_console.insert(
-            tk.END,
-            f"[{time.strftime('%H:%M:%S')}] ID={msg.arbitration_id:03X} DLC={msg.dlc} DATA={msg.data.hex().upper()}\n"
-        )
-        self.raw_console.see(tk.END)
-
-    def log_oracle(self, msg):
-        self.oracle_console.insert(tk.END, f"{msg}\n")
-        self.oracle_console.see(tk.END)
-
-    def _refresh_status(self):
-        st = self.ecu.state
-
-        if st.session == 0x01:
-            sess = "DEFAULT"
-        elif st.session == 0x02:
-            sess = "PROGRAMMING"
-        else:
-            sess = "EXTENDED"
-
-        self.lbl_session.config(text=f"Session: {sess}")
-        self.lbl_security.config(text=f"Security: {'LOCKED' if st.security_level == 0 else 'UNLOCKED'}")
-
-        attempts = self.ecu.nvm.store["persistent_auth_failures"] if st.persistent_lockout else st.auth_failures_ram
-        self.lbl_attempts.config(text=f"Attempts: {attempts}/{st.max_attempts}")
-
-        self.lbl_boot.config(text=f"Boot: {self.ecu.nvm.store['boot_count']}")
-
-        if st.faulted:
-            self.lbl_fault.config(text=f"Fault: YES ({st.fault_reason})")
-        else:
-            self.lbl_fault.config(text="Fault: NO")
-
-        self.root.after(200, self._refresh_status)
+        val = self.var_persistent.get()
+        self.ecu.state.persistent_lockout = val
+        _elog.info(f"[GUI] Persistent lockout → {val}")
 
     def _clear_logs(self):
-        self.uds_console.delete(1.0, tk.END)
-        self.raw_console.delete(1.0, tk.END)
-        self.oracle_console.delete(1.0, tk.END)
+        self.log_uds_panel.clear()
+        self.log_can_panel.clear()
+        self.log_oracle_panel.clear()
+        _elog.info("[GUI] Logs cleared")
+
+    def _export_log(self):
+        from shutil import copyfile
+        dest = filedialog.asksaveasfilename(
+            title="Export ECU Log",
+            defaultextension=".log",
+            filetypes=(("Log files","*.log"),("JSONL","*.jsonl"),("All","*.*")),
+            initialfile="ecu_simulation_export.log",
+        )
+        if not dest:
+            return
+        try:
+            copyfile("logs/ecu_simulation.log", dest)
+            self.log_uds(f"[SYSTEM] Exported → {dest}")
+            _elog.info(f"[GUI] Log exported to {dest}")
+        except Exception as exc:
+            self.log_uds(f"[SYSTEM][ERR] Export failed: {exc}")
+            _elog.error(f"[GUI] Export failed: {exc}")
 
     def _exit(self):
+        _elog.info("[GUI] Exit requested")
+        self.anim.stop()
         self.ecu.stop()
         self.root.destroy()
